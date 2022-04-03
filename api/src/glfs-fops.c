@@ -516,6 +516,154 @@ invalid_fs:
     return glfd;
 }
 
+static inline void
+cleanup_fopat_args(struct glfs_fd *pglfd, xlator_t *subvol, int ret,
+                   dict_t *dict, loc_t *loc)
+{
+    if (dict)
+        dict_unref(dict);
+
+    if (loc) {
+        loc_wipe(loc);
+    }
+
+    glfs_subvol_done(pglfd->fs, subvol);
+
+    GF_REF_PUT(pglfd);
+}
+
+xlator_t *
+setup_fopat_args(struct glfs_fd *pglfd, const char *path, int flags, loc_t *loc,
+                 dict_t **xattr, struct iatt *iatt)
+{
+    int ret = 0;
+    gf_boolean_t no_follow = false;
+    xlator_t *subvol = NULL;
+
+    GF_REF_GET(pglfd);
+
+    subvol = glfs_active_subvol(pglfd->fs);
+    if (!subvol) {
+        ret = -1;
+        errno = EIO;
+        goto out;
+    }
+
+    no_follow = (flags & AT_SYMLINK_NOFOLLOW) == AT_SYMLINK_NOFOLLOW;
+
+    glfs_lock(pglfd->fs, _gf_true);
+    {
+        ret = glfs_resolve_at(pglfd->fs, subvol, pglfd->fd->inode, path, loc,
+                              iatt, !no_follow, 0);
+    }
+    glfs_unlock(pglfd->fs);
+
+    if (ret < 0) {
+        if ((flags & O_CREAT) && errno == ENOENT) {
+            loc->inode = inode_new(loc->parent->table);
+            if (!loc->inode) {
+                ret = -1;
+                errno = ENOMEM;
+                goto out;
+            }
+        } else {
+            goto out;
+        }
+    }
+
+    ret = get_fop_attr_thrd_key(xattr);
+    if (ret)
+        gf_msg_debug("gfapi", 0, "Getting leaseid from thread failed");
+
+    ret = 0;
+out:
+    if (ret < 0) {
+        cleanup_fopat_args(pglfd, subvol, ret, NULL, loc);
+        subvol = NULL;
+    }
+
+    return subvol;
+}
+
+GFAPI_SYMVER_PUBLIC_DEFAULT(glfs_openat, 11.0)
+struct glfs_fd *
+pub_glfs_openat(struct glfs_fd *pglfd, const char *path, int flags, mode_t mode)
+{
+    int ret = -1;
+    struct glfs_fd *glfd = NULL;
+    xlator_t *subvol = NULL;
+    loc_t loc = {
+        0,
+    };
+    dict_t *fop_attr = NULL;
+    struct iatt iatt = {0};
+    uuid_t gfid;
+    gf_boolean_t is_create = 0;
+
+    DECLARE_OLD_THIS;
+    __GLFS_ENTRY_VALIDATE_FD(pglfd, invalid_fs);
+
+    is_create = !!(flags & O_CREAT);
+    subvol = setup_fopat_args(pglfd, path, flags, &loc, &fop_attr, &iatt);
+    if (!subvol) {
+        goto out;
+    }
+
+    glfd = glfs_fd_new(pglfd->fs);
+    if (!glfd) {
+        ret = -1;
+        goto out;
+    }
+
+    glfd->fd = fd_create(loc.inode, getpid());
+    if (!glfd->fd) {
+        ret = -1;
+        errno = ENOMEM;
+        goto out;
+    }
+    glfd->fd->flags = flags;
+
+    if (!is_create) {
+        ret = syncop_open(subvol, &loc, flags, glfd->fd, fop_attr, NULL);
+    } else {
+        gf_uuid_generate(gfid);
+        if (!fop_attr) {
+            /* create */
+            fop_attr = dict_new();
+            if (!fop_attr) {
+                ret = -1;
+                errno = ENOMEM;
+                goto out;
+            }
+        }
+        ret = dict_set_gfuuid(fop_attr, "gfid-req", gfid, true);
+        if (ret) {
+            ret = -1;
+            errno = ENOMEM;
+            goto out;
+        }
+        ret = syncop_create(subvol, &loc, flags, mode, glfd->fd, &iatt,
+                            fop_attr, NULL);
+    }
+    DECODE_SYNCOP_ERR(ret);
+
+    /* Because it is openat(), no ESTALE expected */
+out:
+    if (ret && glfd) {
+        GF_REF_PUT(glfd);
+        glfd = NULL;
+    } else if (glfd) {
+        glfd_set_state_bind(glfd);
+    }
+
+    cleanup_fopat_args(pglfd, subvol, ret, fop_attr, &loc);
+
+    __GLFS_EXIT_FS;
+
+invalid_fs:
+    return glfd;
+}
+
 GFAPI_SYMVER_PUBLIC_DEFAULT(glfs_close, 3.4.0)
 int
 pub_glfs_close(struct glfs_fd *glfd)
